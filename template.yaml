@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  cb-monitor - watches EC2 Capacity Blocks for ML offerings across Regions and
+  emails new capacity and a daily summary. It only queries; it never purchases.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Notification }
+        Parameters: [NotificationEmail, SummaryScheduleExpression, SummaryTimezone, DisplayTimezone]
+      - Label: { default: Search criteria }
+        Parameters:
+          [InstanceTypes, CandidateRegions, MinStartOffsetDays, MaxAdvanceDays, DurationsDays,
+           MaxInstanceCount, WeeklySlices, ExcludeLocalZones]
+      - Label: { default: Scheduling and API usage }
+        Parameters: [ScanIntervalMinutes, DetailRefreshMinutes, ApiCallsPerMinute, LogRetentionDays]
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email address for notifications. AWS sends a confirmation email that must be accepted. Leave empty to add subscribers later.
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+  InstanceTypes:
+    Type: String
+    Default: p6-b300.48xlarge,p6-b200.48xlarge
+    Description: Comma-separated instance types.
+  CandidateRegions:
+    Type: String
+    Default: us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-2,eu-west-3,eu-central-1,eu-central-2,eu-north-1,eu-south-1,eu-south-2
+    Description: Comma-separated Regions. Regions that are not enabled or do not offer Capacity Blocks for an instance type are dropped automatically.
+  MinStartOffsetDays:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 55
+    Description: Earliest start, in days from now.
+  MaxAdvanceDays:
+    Type: Number
+    Default: 56
+    MinValue: 1
+    MaxValue: 56
+    Description: Latest start, in days from now (Capacity Blocks can start up to 8 weeks ahead).
+  DurationsDays:
+    Type: String
+    Default: 1-14,21-175/7
+    Description: Durations in days. "A-B" is a range, "/7" a step. Allowed values are 1-14 and multiples of 7 up to 182.
+  MaxInstanceCount:
+    Type: Number
+    Default: 64
+    MinValue: 1
+    MaxValue: 64
+    Description: Largest single Capacity Block size to search for.
+  WeeklySlices:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Report capacity per start week (true) or for the whole window (false).
+  ExcludeLocalZones:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Ignore offerings in Local Zones (for example us-east-1-atl-2a).
+  ScanIntervalMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 15
+    MaxValue: 1440
+    Description: Minutes between scans. The function runs for up to 14 minutes, so 15 is the minimum.
+  DetailRefreshMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 15
+    Description: How often the max-count-per-duration of a week that already has capacity is re-measured. New capacity in empty weeks is checked on every scan.
+  ApiCallsPerMinute:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 9
+    Description: DescribeCapacityBlockOfferings calls per minute per Region. AWS refills about 9 per minute per account and Region.
+  SummaryScheduleExpression:
+    Type: String
+    Default: cron(0 9 * * ? *)
+    Description: EventBridge Scheduler expression for the daily summary.
+  SummaryTimezone:
+    Type: String
+    Default: Asia/Shanghai
+    Description: Time zone of SummaryScheduleExpression.
+  DisplayTimezone:
+    Type: String
+    Default: Asia/Shanghai
+    Description: Time zone shown next to UTC in emails (IANA name or UTC+8).
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: CB Monitor
+      KmsMasterKeyId: alias/aws/sns
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-monitor"
+      RetentionInDays: !Ref LogRetentionDays
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cb-monitor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt FunctionLogGroup.Arn
+              - Sid: QueryCapacityBlocks
+                Effect: Allow
+                Action: [ec2:DescribeCapacityBlockOfferings, ec2:DescribeRegions]
+                Resource: "*"
+              - Sid: Publish
+                Effect: Allow
+                Action: [sns:Publish, sns:GetTopicAttributes]
+                Resource: !Ref AlertTopic
+              - Sid: PublishToEncryptedTopic
+                Effect: Allow
+                Action: [kms:GenerateDataKey*, kms:Decrypt]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "sns.${AWS::Region}.amazonaws.com"
+              - Sid: State
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:BatchGetItem]
+                Resource: !GetAtt StateTable.Arn
+
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-monitor"
+      Description: Scans EC2 Capacity Blocks for ML offerings and emails new capacity
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: cbmon.handler.lambda_handler
+      Code: src/
+      MemorySize: 512
+      Timeout: 840
+      Role: !GetAtt FunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref StateTable
+          TOPIC_ARN: !Ref AlertTopic
+          INSTANCE_TYPES: !Ref InstanceTypes
+          CANDIDATE_REGIONS: !Ref CandidateRegions
+          MIN_START_OFFSET_DAYS: !Ref MinStartOffsetDays
+          MAX_ADVANCE_DAYS: !Ref MaxAdvanceDays
+          DURATIONS_DAYS: !Ref DurationsDays
+          MAX_INSTANCE_COUNT: !Ref MaxInstanceCount
+          WEEKLY_SLICES: !Ref WeeklySlices
+          EXCLUDE_LOCAL_ZONES: !Ref ExcludeLocalZones
+          SCAN_INTERVAL_MINUTES: !Ref ScanIntervalMinutes
+          DETAIL_REFRESH_MINUTES: !Ref DetailRefreshMinutes
+          API_CALLS_PER_MINUTE: !Ref ApiCallsPerMinute
+          DISPLAY_TIMEZONE: !Ref DisplayTimezone
+
+  # Scheduler invokes asynchronously; a failed scan is not retried (the next one comes soon).
+  MonitorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref MonitorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-monitor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt MonitorFunction.Arn
+
+  ScanSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-scan"
+      Description: Scan Capacity Block offerings
+      ScheduleExpression: !Sub "rate(${ScanIntervalMinutes} minutes)"
+      FlexibleTimeWindow: { Mode: "OFF" }
+      State: ENABLED
+      Target:
+        Arn: !GetAtt MonitorFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"mode": "scan"}'
+        RetryPolicy: { MaximumRetryAttempts: 0 }
+
+  SummarySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-daily-summary"
+      Description: Daily summary email
+      ScheduleExpression: !Ref SummaryScheduleExpression
+      ScheduleExpressionTimezone: !Ref SummaryTimezone
+      FlexibleTimeWindow: { Mode: "OFF" }
+      State: ENABLED
+      Target:
+        Arn: !GetAtt MonitorFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"mode": "summary"}'
+        RetryPolicy: { MaximumRetryAttempts: 2 }
+
+Outputs:
+  FunctionName:
+    Value: !Ref MonitorFunction
+  TopicArn:
+    Description: Add more subscribers to this SNS topic.
+    Value: !Ref AlertTopic
+  TableName:
+    Value: !Ref StateTable
+  LogGroupName:
+    Value: !Ref FunctionLogGroup
